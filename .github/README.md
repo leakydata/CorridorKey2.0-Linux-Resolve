@@ -20,7 +20,7 @@ All of the hard work here is not mine:
   **Niko Pueringer and Corridor Digital**. This fork exists only because they released it openly.
   Upstream: <https://github.com/nikopueringer/CorridorKey2.0>. Weights: <https://huggingface.co/nikopueringer/CorridorKey2.0>.
 - The frozen foundation models it builds on (NVIDIA C-RADIOv4, Microsoft MoGe-2, Google DeepMind RVM) remain under
-  their own licences; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+  their own licences; see [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md).
 - **This is not the official CorridorKey plugin.** The official, paid plugins for many editing/compositing apps are
   made by Ale Alvaro and Corridor Digital at <https://corridorkey.com>. If you use Windows/macOS, or want a
   supported product, or want to support the people who made the model, buy that. This fork only adds an
@@ -29,7 +29,7 @@ All of the hard work here is not mine:
 
 ## Licence
 
-Same as upstream: the **Corridor Key Licence 2.0** (CC BY-NC-SA 4.0 plus additional terms), see [LICENSE](LICENSE).
+Same as upstream: the **Corridor Key Licence 2.0** (CC BY-NC-SA 4.0 plus additional terms), see [LICENSE](../LICENSE).
 In short, and without replacing the licence text:
 
 - Free to use, including on commercial projects; this fork is and will stay free. No repackaging or resale.
@@ -52,7 +52,7 @@ In short, and without replacing the licence text:
 git clone https://github.com/leakydata/CorridorKey2.0-Linux-Resolve.git
 cd CorridorKey2.0-Linux-Resolve
 
-# environment + weights (about 5 GB), exactly as in README.upstream.md. Python 3.12 recommended:
+# environment + weights (about 5 GB), exactly as in the upstream [README.md](../README.md). Python 3.12 recommended:
 uv venv -p 3.12 venv
 VIRTUAL_ENV=$PWD/venv uv pip install torch==2.9.1 torchvision==0.24.1 --index-url https://download.pytorch.org/whl/cu128
 VIRTUAL_ENV=$PWD/venv uv pip install -r requirements.txt
@@ -95,7 +95,7 @@ Files and logs: results in `~/Videos/CorridorKey/<project>/...`, job logs in
 Out-of-process "render and replace": a stdlib-only stub runs inside Resolve, records the selection, writes a job
 file and spawns a detached worker (so Resolve never freezes). The worker (Resolve external scripting) trims the
 clip's exact source range with ffmpeg, runs the unmodified upstream `infer.py` in its venv, imports the results and
-places them on the timeline. All integration code is in [`resolve/`](resolve/); upstream files are untouched.
+places them on the timeline. All integration code is in [`resolve/`](../resolve/); upstream files are untouched.
 
 ## Known limitations
 
@@ -111,4 +111,4 @@ places them on the timeline. All integration code is in [`resolve/`](resolve/); 
 Linux + DaVinci Resolve only for now. Other hosts are possible far in the future, not planned.
 
 Upstream's own documentation (inference modes, hint video, HDR output, VRAM tuning, CLI flags) is kept in
-[README.upstream.md](README.upstream.md).
+the original [README.md](../README.md).
