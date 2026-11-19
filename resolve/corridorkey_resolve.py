@@ -74,77 +74,109 @@ def notify(title, body="", urgent=False):
 
 # --------------------------------------------------------------------------- inside Resolve
 
+class CKError(Exception):
+    """A problem to show the user: title + body (becomes a notification from the menu, a message in the CLI)."""
+    def __init__(self, title, body=""):
+        super().__init__("%s: %s" % (title, body) if body else title)
+        self.title, self.body = title, body
+
+
+def keyable_clips(seq):
+    """Drop transitions (they come back alongside clips in a selection; not keyable and not an error)."""
+    out = []
+    for i in seq or []:
+        try:
+            if i.GetType() == "transition":
+                continue
+        except Exception:
+            pass
+        out.append(i)
+    return out
+
+
+def preflight(cfg=None):
+    """Check the environment a job needs. Returns the config; raises CKError with a fix hint."""
+    cfg = cfg or load_config()
+    if not cfg["ck_dir"] or not os.path.isfile(os.path.join(cfg["ck_dir"], "infer.py")):
+        raise CKError("CorridorKey not configured", "Run install.py (ck_dir missing in %s)" % CONFIG_PATH)
+    missing = [e for e in ("ffmpeg", "ffprobe", "nvidia-smi") if not shutil.which(e)]
+    if missing:
+        raise CKError("CorridorKey: missing tools", "%s not found on PATH (Resolve's environment)." % ", ".join(missing))
+    venv_py = cfg["python"] or os.path.join(cfg["ck_dir"], "venv", "bin", "python")
+    if not os.path.isfile(venv_py):
+        raise CKError("CorridorKey not configured", "Python for CorridorKey not found: %s" % venv_py)
+    return cfg
+
+
+def create_job(resolve, mode="video", items=None):
+    """Write job.json and start the supervised worker. `items` = timeline items to key; None = the timeline's
+    selection, else the clip under the playhead (what the menu entries do). Returns the job dict (with "dir").
+    Raises CKError for anything the user can fix."""
+    cfg = preflight()
+    project = resolve.GetProjectManager().GetCurrentProject()
+    timeline = project.GetCurrentTimeline() if project else None
+    if timeline is None:
+        raise CKError("CorridorKey", "Open a timeline first.")
+    if items is None:
+        items = keyable_clips(timeline.GetSelectedClips())
+        if not items:
+            cur = timeline.GetCurrentVideoItem()
+            items = keyable_clips([cur] if cur else [])
+        if not items:
+            raise CKError("CorridorKey", "Select a clip on the timeline (or park the playhead on one).")
+    else:
+        items = keyable_clips(items)
+        if not items:
+            raise CKError("CorridorKey", "No keyable clips given.")
+
+    job_id = time.strftime("%Y%m%d-%H%M%S")
+    job_dir = os.path.join(STATE_DIR, "jobs", job_id)
+    n = 1
+    while os.path.exists(job_dir):  # two jobs in the same second (CLI) must not share a directory
+        n += 1
+        job_dir = os.path.join(STATE_DIR, "jobs", "%s-%d" % (job_id, n))
+    job_id = os.path.basename(job_dir)
+    os.makedirs(job_dir)
+    job = {
+        "id": job_id,
+        "mode": mode,
+        "project": project.GetName(),
+        "timeline_id": timeline.GetUniqueId(),
+        "timeline_name": timeline.GetName(),
+        "items": [{"id": i.GetUniqueId(), "name": i.GetName()} for i in items],
+    }
+    job_path = os.path.join(job_dir, "job.json")
+    with open(job_path, "w") as f:
+        json.dump(job, f, indent=2)
+
+    py = cfg["worker_python"] or ("/opt/resolve/bin/ResolvePython"
+                                   if os.path.exists("/opt/resolve/bin/ResolvePython") else "python3")
+    env = dict(os.environ)
+    env.update(RESOLVE_SCRIPT_API=RESOLVE_API, RESOLVE_SCRIPT_LIB=RESOLVE_LIB)
+    # ResolvePython (bundled CPython, 21.2+) runs in isolated mode and ignores PYTHONPATH, so the module
+    # search path is set explicitly inside the worker instead.
+    here = os.path.dirname(os.path.abspath(__file__))
+    boot = ("import sys; sys.path[:0] = %r; "
+            "import corridorkey_resolve as m; m.worker_main(sys.argv[1])" % ([here, RESOLVE_API + "/Modules"],))
+    log = open(os.path.join(job_dir, "worker.log"), "ab")
+    cmd = [py, "-c", boot, job_path]
+    sup = shutil.which("python3")
+    if sup:  # a stdlib supervisor reports a failure if the worker dies without writing result.json
+        cmd = [sup, "-I", "-c", "import sys; sys.path.insert(0, %r); import corridorkey_resolve as m; "
+               "m.supervise(sys.argv[1], sys.argv[2:])" % here, job_path] + cmd
+    subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=log, env=env,
+                     start_new_session=True, close_fds=True)
+    job["dir"] = job_dir
+    return job
+
+
 def launch(resolve, mode="video"):
     """Entry point for the menu stubs. mode: "video" (ProRes 4444) or "exr" (linear half-float EXR)."""
     try:
-        cfg = load_config()
-        if not cfg["ck_dir"] or not os.path.isfile(os.path.join(cfg["ck_dir"], "infer.py")):
-            return notify("CorridorKey not configured", "Run install.py (ck_dir missing in %s)" % CONFIG_PATH, True)
-        missing = [e for e in ("ffmpeg", "ffprobe", "nvidia-smi") if not shutil.which(e)]
-        if missing:
-            return notify("CorridorKey: missing tools", "%s not found on PATH (Resolve's environment)." %
-                          ", ".join(missing), True)
-        venv_py = cfg["python"] or os.path.join(cfg["ck_dir"], "venv", "bin", "python")
-        if not os.path.isfile(venv_py):
-            return notify("CorridorKey not configured", "Python for CorridorKey not found: %s" % venv_py, True)
-        project = resolve.GetProjectManager().GetCurrentProject()
-        timeline = project.GetCurrentTimeline() if project else None
-        if timeline is None:
-            return notify("CorridorKey", "Open a timeline first.", True)
-
-        def _clips(seq):
-            # transitions come back alongside clips in a selection; they are not keyable and not an error
-            out = []
-            for i in seq:
-                try:
-                    if i.GetType() == "transition":
-                        continue
-                except Exception:
-                    pass
-                out.append(i)
-            return out
-
-        items = _clips(timeline.GetSelectedClips() or [])
-        if not items:
-            cur = timeline.GetCurrentVideoItem()
-            items = _clips([cur] if cur else [])
-        if not items:
-            return notify("CorridorKey", "Select a clip on the timeline (or park the playhead on one).", True)
-
-        job_id = time.strftime("%Y%m%d-%H%M%S")
-        job_dir = os.path.join(STATE_DIR, "jobs", job_id)
-        os.makedirs(job_dir, exist_ok=True)
-        job = {
-            "id": job_id,
-            "mode": mode,
-            "project": project.GetName(),
-            "timeline_id": timeline.GetUniqueId(),
-            "timeline_name": timeline.GetName(),
-            "items": [{"id": i.GetUniqueId(), "name": i.GetName()} for i in items],
-        }
-        job_path = os.path.join(job_dir, "job.json")
-        with open(job_path, "w") as f:
-            json.dump(job, f, indent=2)
-
-        py = cfg["worker_python"] or ("/opt/resolve/bin/ResolvePython"
-                                       if os.path.exists("/opt/resolve/bin/ResolvePython") else "python3")
-        env = dict(os.environ)
-        env.update(RESOLVE_SCRIPT_API=RESOLVE_API, RESOLVE_SCRIPT_LIB=RESOLVE_LIB)
-        # ResolvePython (bundled CPython, 21.2+) runs in isolated mode and ignores PYTHONPATH, so the module
-        # search path is set explicitly inside the worker instead.
-        paths = [os.path.dirname(os.path.abspath(__file__)), RESOLVE_API + "/Modules"]
-        boot = ("import sys; sys.path[:0] = %r; "
-                "import corridorkey_resolve as m; m.worker_main(sys.argv[1])" % (paths,))
-        log = open(os.path.join(job_dir, "worker.log"), "ab")
-        cmd = [py, "-c", boot, job_path]
-        sup = shutil.which("python3")
-        if sup:  # a stdlib supervisor reports a failure if the worker dies without writing result.json
-            cmd = [sup, "-I", "-c", "import sys; sys.path.insert(0, %r); import corridorkey_resolve as m; "
-                   "m.supervise(sys.argv[1], sys.argv[2:])" % os.path.dirname(os.path.abspath(__file__)),
-                   job_path] + cmd
-        subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=log, env=env,
-                         start_new_session=True, close_fds=True)
-        notify("CorridorKey started", "%d clip(s), %s. Log: %s" % (len(items), mode, job_dir))
+        job = create_job(resolve, mode)
+        notify("CorridorKey started", "%d clip(s), %s. Log: %s" % (len(job["items"]), mode, job["dir"]))
+    except CKError as ex:
+        notify(ex.title, ex.body, True)
     except Exception:
         notify("CorridorKey failed to start", traceback.format_exc().splitlines()[-1], True)
         traceback.print_exc()
@@ -338,9 +370,16 @@ def free_track_above(timeline, track, start, end):
     return timeline.GetTrackCount("video")
 
 
-def key_one(resolve, cfg, job, timeline, ref, gpu):
+def _ref_path(ref):
+    return ref[0] if isinstance(ref, tuple) else ref
+
+
+def key_one(resolve, cfg, job, timeline, ref, gpu, detail=None):
+    """Key one timeline item. Returns a one-line message; fills `detail` (a dict) with structured facts."""
+    detail = detail if detail is not None else {}
     project = resolve.GetProjectManager().GetCurrentProject()
     info = describe_item(timeline, ref)
+    detail.update(clip=info["name"], frames=info["frames"], rec_start=info["rec_start"], mode=job["mode"])
     exr = job["mode"] == "exr"
     stem = "%s_f%d-%d" % (safe_name(info["name"]), info["src_start"], info["src_end"])
     out_dir = os.path.join(cfg["output_root"], safe_name(job["project"]), "%s_%s" % (stem, job["id"]))
@@ -353,6 +392,8 @@ def key_one(resolve, cfg, job, timeline, ref, gpu):
     rate = make_intermediate(info, in_path)
     run_inference(cfg, job, in_path, out_dir, gpu)
     cutout_ref, alpha_ref = collect_outputs(out_dir, stem, exr)
+    detail.update(output_dir=out_dir, cutout=_ref_path(cutout_ref),
+                  alpha=_ref_path(alpha_ref) if alpha_ref is not None else os.path.join(out_dir, stem + "_alpha.mp4"))
     if not cfg["keep_intermediate"]:
         os.remove(in_path)
 
@@ -400,6 +441,7 @@ def key_one(resolve, cfg, job, timeline, ref, gpu):
         if placed:
             cur.DeleteClips([p for p in placed if p])
         return "imported to the %s bin but placement failed: %s" % (BIN_NAME, info["name"])
+    detail.update(track=t, placed_item_id=placed[0].GetUniqueId())
     return "keyed %s -> V%d" % (info["name"], t)
 
 
@@ -413,6 +455,8 @@ def supervise(job_path, worker_cmd):
         rc = "could not start worker: %s" % ex
     if not os.path.exists(result):
         msg = "worker exited unexpectedly (%s); see %s" % (rc, os.path.join(job_dir, "worker.log"))
+        with open(os.path.join(job_dir, "result_detail.json"), "w") as f:
+            json.dump([{"status": "failed", "message": msg}], f, indent=2)
         with open(result, "w") as f:
             json.dump(["FAILED: " + msg], f, indent=2)
         notify("CorridorKey finished with errors", msg, True)
@@ -425,7 +469,7 @@ def supervise(job_path, worker_cmd):
 def worker_main(job_path):
     with open(job_path) as f:
         job = json.load(f)
-    results = []
+    results, details = [], []
     try:
         cfg = load_config()
         import DaVinciResolveScript as dvr
@@ -438,15 +482,25 @@ def worker_main(job_path):
             raise RuntimeError("project/timeline changed before the worker started")
         gpu = pick_gpu(cfg["gpu"])
         for ref in job["items"]:
+            d = {"clip": ref["name"], "item_id": ref["id"]}
             try:
-                results.append(key_one(resolve, cfg, job, timeline, ref, gpu))
+                msg = key_one(resolve, cfg, job, timeline, ref, gpu, d)
+                d["status"] = "keyed" if msg.startswith("keyed") else "imported"
             except Exception as ex:
                 traceback.print_exc()
-                results.append("FAILED %s: %s" % (ref["name"], ex))
+                msg = "FAILED %s: %s" % (ref["name"], ex)
+                d["status"] = "failed"
+            d["message"] = msg
+            results.append(msg)
+            details.append(d)
     except Exception as ex:
         traceback.print_exc()
         results.append("FAILED: %s" % ex)
+        details.append({"status": "failed", "message": "FAILED: %s" % ex})
     failed = any(r.startswith("FAILED") for r in results)
-    with open(os.path.join(os.path.dirname(job_path), "result.json"), "w") as f:
+    out = os.path.dirname(job_path)
+    with open(os.path.join(out, "result_detail.json"), "w") as f:   # before result.json, which callers wait on
+        json.dump(details, f, indent=2)
+    with open(os.path.join(out, "result.json"), "w") as f:
         json.dump(results, f, indent=2)
     notify("CorridorKey " + ("finished with errors" if failed else "done"), "; ".join(results), failed)

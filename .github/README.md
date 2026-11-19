@@ -52,7 +52,7 @@ In short, and without replacing the licence text:
 git clone https://github.com/leakydata/CorridorKey2.0-Linux-Resolve.git
 cd CorridorKey2.0-Linux-Resolve
 
-# environment + weights (about 5 GB), exactly as in the upstream [README.md](../README.md). Python 3.12 recommended:
+# environment + weights (about 5 GB), exactly as in the upstream README.md. Python 3.12 recommended:
 uv venv -p 3.12 venv
 VIRTUAL_ENV=$PWD/venv uv pip install torch==2.9.1 torchvision==0.24.1 --index-url https://download.pytorch.org/whl/cu128
 VIRTUAL_ENV=$PWD/venv uv pip install -r requirements.txt
@@ -62,19 +62,51 @@ venv/bin/python scripts/download_weights.py
 python3 resolve/install.py
 ```
 
-Restart Resolve. `python3 resolve/install.py --uninstall` removes the menu entries.
+Restart Resolve. This also links a `corridorkey-resolve` command into `~/.local/bin` (see
+[Command line and AI agents](#command-line-and-ai-agents)); run `corridorkey-resolve doctor` to check the install.
+`python3 resolve/install.py --uninstall` removes the menu entries and the command.
 
 ## Use
 
 1. Put a green/blue-screen clip on the timeline and select it (or park the playhead on it).
 2. `Workspace > Scripts > Utility > CorridorKey - Key selected clip` (ProRes 4444) or `... (HDR EXR)`.
-3. Keep working. A desktop notification appears when it starts and finishes. Jobs are queued per machine so two
+3. Keep working, but leave the same project and timeline open until the job finishes. A desktop notification
+   appears when it starts and finishes. Jobs are queued per machine so two
    runs never fight for the GPU.
 4. The result is imported into a **CorridorKey** media-pool bin (cutout + alpha matte) and the cutout is placed on
    the first free video track above the clip, aligned to it. Put your background below.
 
 Files and logs: results in `~/Videos/CorridorKey/<project>/...`, job logs in
 `~/.local/state/corridorkey-resolve/jobs/<id>/worker.log`.
+
+## Command line and AI agents
+
+Everything the menu does is also available without the GUI, for scripts and AI agents. Resolve must be running
+(Preferences > System > General > External scripting using: Local).
+
+```bash
+corridorkey-resolve doctor                       # check install, GPU, Resolve connection
+corridorkey-resolve list                         # clips on the current timeline: id, track, keyable or why not
+corridorkey-resolve key --clip "shot1.mov" --wait          # key a clip by name and wait for the result
+corridorkey-resolve key --track 1 --mode exr               # key every clip on V1 as EXR, return immediately
+corridorkey-resolve key --id <timeline-item-id> --wait --json
+corridorkey-resolve status [JOB_ID] [--wait]; corridorkey-resolve jobs
+```
+
+Add `--json` to any command for a single machine-readable JSON object (errors included). With no filter, `key`
+behaves like the menu: the selection, else the clip under the playhead. Exit codes: `0` ok, `1` finished with
+failures or `doctor` found problems, `2` usage/environment error, `3` `--wait` timed out. Each job writes
+`result.json` (one line per clip) and `result_detail.json` (status, track, placed item id, output files) next to its
+log in `~/.local/state/corridorkey-resolve/jobs/<id>/`.
+
+**MCP server.** `resolve/mcp_server.py` (standard library only) exposes the same operations as MCP tools
+(`corridorkey_doctor`, `corridorkey_list_clips`, `corridorkey_key_clips`, `corridorkey_job_status`,
+`corridorkey_recent_jobs`). It runs *alongside* Blackmagic's own Resolve MCP, which has a fixed tool list and
+cannot be extended. Register it, for example, with
+`claude mcp add corridorkey-resolve -- python3 /path/to/resolve/mcp_server.py`, or in a client's JSON config as
+`{"command": "python3", "args": ["/path/to/resolve/mcp_server.py"]}`. Keying a few seconds of footage takes about a
+minute or more, so `corridorkey_key_clips` returns a job id immediately and `corridorkey_job_status` can wait up to
+50 seconds per call.
 
 ## Configuration
 
