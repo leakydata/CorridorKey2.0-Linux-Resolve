@@ -111,11 +111,13 @@ def launch(resolve, mode="video"):
                                        if os.path.exists("/opt/resolve/bin/ResolvePython") else "python3")
         env = dict(os.environ)
         env.update(RESOLVE_SCRIPT_API=RESOLVE_API, RESOLVE_SCRIPT_LIB=RESOLVE_LIB)
-        env["PYTHONPATH"] = os.pathsep.join(
-            [os.path.dirname(os.path.abspath(__file__)), RESOLVE_API + "/Modules"]
-            + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
+        # ResolvePython (bundled CPython, 21.2+) runs in isolated mode and ignores PYTHONPATH, so the module
+        # search path is set explicitly inside the worker instead.
+        paths = [os.path.dirname(os.path.abspath(__file__)), RESOLVE_API + "/Modules"]
+        boot = ("import sys; sys.path[:0] = %r; "
+                "import corridorkey_resolve as m; m.worker_main(sys.argv[1])" % (paths,))
         log = open(os.path.join(job_dir, "worker.log"), "ab")
-        subprocess.Popen([py, "-c", "import corridorkey_resolve as m, sys; m.worker_main(sys.argv[1])", job_path],
+        subprocess.Popen([py, "-c", boot, job_path],
                          stdin=subprocess.DEVNULL, stdout=log, stderr=log, env=env,
                          start_new_session=True, close_fds=True)
         notify("CorridorKey started", "%d clip(s), %s. Log: %s" % (len(items), mode, job_dir))
@@ -211,8 +213,11 @@ def describe_item(timeline, ref):
         raise ValueError("retimed clips (%.1f%%) are not supported" % pct)
     s, e = int(item.GetSourceStartFrame()), int(item.GetSourceEndFrame())
     start, dur = int(item.GetStart()), int(item.GetDuration())
-    if e - s + 1 != dur:
-        raise ValueError("source range (%d frames) != timeline duration (%d); retimed or in a transition?" % (e - s + 1, dur))
+    # GetSourceEndFrame is exclusive in Resolve 21.2 (inclusive in some older builds, per the scripting docs):
+    # accept either, and treat the timeline duration as the truth for the frame count.
+    if e - s not in (dur, dur - 1):
+        raise ValueError("source range (%d..%d) doesn't match timeline duration (%d); retimed or in a transition?" % (s, e, dur))
+    e = s + dur - 1
     return {"item": item, "mpi": mpi, "track": track, "path": path, "name": item.GetName(),
             "src_start": s, "src_end": e, "rec_start": start, "frames": dur,
             "fusion_comps": item.GetFusionCompCount()}
@@ -264,7 +269,7 @@ def collect_outputs(out_dir, stem, exr):
     return refs[0], refs[1]
 
 
-def import_clip(mp, ref, name):
+def import_clip(mp, ref, name, fps=None):
     if isinstance(ref, tuple):
         d, frames = ref
         m = re.match(r"^(.*?)(\d+)\.exr$", frames[0], re.I)
@@ -274,12 +279,14 @@ def import_clip(mp, ref, name):
         if not got:
             got = mp.ImportMedia([d])
     else:
-        got = mp.ImportMedia([{"FilePath": ref}])
+        got = mp.ImportMedia([ref])  # the {"FilePath": ...} dict form is for sequences only; returns None here
     if not got:
         raise RuntimeError("Resolve refused to import %s" % (ref[0] if isinstance(ref, tuple) else ref))
     clip = got[0]
     try:
         clip.SetClipProperty("Clip Name", name)
+        if isinstance(ref, tuple) and fps:
+            clip.SetClipProperty("FPS", str(fps))  # image sequences import at Resolve's default 24 fps
     except Exception:
         pass
     return clip
@@ -327,16 +334,17 @@ def key_one(resolve, cfg, job, timeline, ref, gpu):
     prev = mp.GetCurrentFolder()
     mp.SetCurrentFolder(ensure_bin(mp))
     try:
-        cut = import_clip(mp, cutout_ref, "CK_%s" % stem)
+        tl_fps = float(timeline.GetSetting("timelineFrameRate") or 0)
+        cut = import_clip(mp, cutout_ref, "CK_%s" % stem, tl_fps)
         if alpha_ref is not None:
-            import_clip(mp, alpha_ref, "CK_%s_alpha" % stem)
+            import_clip(mp, alpha_ref, "CK_%s_alpha" % stem, tl_fps)
         elif os.path.exists(os.path.join(out_dir, stem + "_alpha.mp4")):
             pass  # alpha preview video is h264 4:4:4; left on disk only
     finally:
         if prev:
             mp.SetCurrentFolder(prev)
     try:
-        cut.SetClipProperty("Alpha Mode", "Straight")
+        cut.SetClipProperty("Alpha mode", "Straight")  # already the default for ProRes 4444 on import; kept explicit
     except Exception:
         pass
 
@@ -347,9 +355,21 @@ def key_one(resolve, cfg, job, timeline, ref, gpu):
     if (info2["rec_start"], info2["frames"]) != (info["rec_start"], info["frames"]):
         return "imported to the %s bin; clip was edited while keying, not placed: %s" % (BIN_NAME, info["name"])
     t = free_track_above(cur, info2["track"], info2["rec_start"], info2["rec_start"] + info2["frames"])
-    placed = mp.AppendToTimeline([{"mediaPoolItem": cut, "startFrame": 0, "endFrame": info["frames"] - 1,
-                                   "trackIndex": t, "recordFrame": info2["rec_start"], "mediaType": 1}])
-    if not placed:
+    n = info["frames"]
+
+    def append(end_frame):
+        return mp.AppendToTimeline([{"mediaPoolItem": cut, "startFrame": 0, "endFrame": end_frame,
+                                     "trackIndex": t, "recordFrame": info2["rec_start"], "mediaType": 1}])
+
+    # endFrame is exclusive in Resolve 21.2 (inclusive per older docs): try the inclusive form, check the length
+    # that actually landed on the timeline, and redo it with the other convention if it is one frame short.
+    placed = append(n - 1)
+    if placed and placed[0] and int(placed[0].GetDuration()) == n - 1:
+        cur.DeleteClips(list(placed))
+        placed = append(n)
+    if not placed or not placed[0] or int(placed[0].GetDuration()) != n:
+        if placed:
+            cur.DeleteClips([p for p in placed if p])
         return "imported to the %s bin but placement failed: %s" % (BIN_NAME, info["name"])
     return "keyed %s -> V%d" % (info["name"], t)
 

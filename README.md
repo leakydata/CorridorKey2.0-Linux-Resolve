@@ -5,8 +5,11 @@ A free, community fork of [CorridorKey 2.0](https://github.com/nikopueringer/Cor
 `Workspace > Scripts > Utility > CorridorKey - Key selected clip`, and the keyed cutout (straight-alpha ProRes
 4444, or linear HDR EXR) lands on a video track above it when the job finishes.
 
-> **Status: early / experimental.** The core pipeline (frame-exact trim -> CorridorKey inference -> output) is
-> tested. The Resolve-side steps (menu launch, import, alpha mode, placement) are still being verified; see
+> **Status: early / experimental.** Verified end to end on Resolve Studio 21.2 for both ProRes 4444 and EXR
+> output: frame-exact trim, inference, import, straight alpha, and placement on the track above the source clip
+> (same length, same record position). The jobs were started through the same `launch()` entry point the menu
+> entries call; clicking the entries from Resolve's Workspace > Scripts menu is still being verified. Only
+> low-resolution, non-green-screen footage has been used so far, so keying quality is untested. See
 > [Known limitations](#known-limitations).
 
 ## Acknowledgements
@@ -36,7 +39,7 @@ In short, and without replacing the licence text:
 
 ## Requirements
 
-- Linux, DaVinci Resolve **Studio** (external scripting is a Studio feature), tested on 21.1.
+- Linux, DaVinci Resolve **Studio** (external scripting is a Studio feature), tested on 21.2.
 - NVIDIA GPU, RTX 30-series or newer, 4+ GB VRAM (see upstream README for VRAM guidance).
   With several GPUs the integration automatically picks the largest CUDA card (>= compute 8.0) and pins
   `CUDA_VISIBLE_DEVICES` to its UUID for the inference process only.
