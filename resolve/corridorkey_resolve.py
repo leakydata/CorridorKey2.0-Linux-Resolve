@@ -80,15 +80,34 @@ def launch(resolve, mode="video"):
         cfg = load_config()
         if not cfg["ck_dir"] or not os.path.isfile(os.path.join(cfg["ck_dir"], "infer.py")):
             return notify("CorridorKey not configured", "Run install.py (ck_dir missing in %s)" % CONFIG_PATH, True)
+        missing = [e for e in ("ffmpeg", "ffprobe", "nvidia-smi") if not shutil.which(e)]
+        if missing:
+            return notify("CorridorKey: missing tools", "%s not found on PATH (Resolve's environment)." %
+                          ", ".join(missing), True)
+        venv_py = cfg["python"] or os.path.join(cfg["ck_dir"], "venv", "bin", "python")
+        if not os.path.isfile(venv_py):
+            return notify("CorridorKey not configured", "Python for CorridorKey not found: %s" % venv_py, True)
         project = resolve.GetProjectManager().GetCurrentProject()
         timeline = project.GetCurrentTimeline() if project else None
         if timeline is None:
             return notify("CorridorKey", "Open a timeline first.", True)
 
-        items = [i for i in (timeline.GetSelectedClips() or [])]
+        def _clips(seq):
+            # transitions come back alongside clips in a selection; they are not keyable and not an error
+            out = []
+            for i in seq:
+                try:
+                    if i.GetType() == "transition":
+                        continue
+                except Exception:
+                    pass
+                out.append(i)
+            return out
+
+        items = _clips(timeline.GetSelectedClips() or [])
         if not items:
             cur = timeline.GetCurrentVideoItem()
-            items = [cur] if cur else []
+            items = _clips([cur] if cur else [])
         if not items:
             return notify("CorridorKey", "Select a clip on the timeline (or park the playhead on one).", True)
 
@@ -117,8 +136,13 @@ def launch(resolve, mode="video"):
         boot = ("import sys; sys.path[:0] = %r; "
                 "import corridorkey_resolve as m; m.worker_main(sys.argv[1])" % (paths,))
         log = open(os.path.join(job_dir, "worker.log"), "ab")
-        subprocess.Popen([py, "-c", boot, job_path],
-                         stdin=subprocess.DEVNULL, stdout=log, stderr=log, env=env,
+        cmd = [py, "-c", boot, job_path]
+        sup = shutil.which("python3")
+        if sup:  # a stdlib supervisor reports a failure if the worker dies without writing result.json
+            cmd = [sup, "-I", "-c", "import sys; sys.path.insert(0, %r); import corridorkey_resolve as m; "
+                   "m.supervise(sys.argv[1], sys.argv[2:])" % os.path.dirname(os.path.abspath(__file__)),
+                   job_path] + cmd
+        subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=log, env=env,
                          start_new_session=True, close_fds=True)
         notify("CorridorKey started", "%d clip(s), %s. Log: %s" % (len(items), mode, job_dir))
     except Exception:
@@ -199,7 +223,9 @@ def describe_item(timeline, ref):
         raise ValueError("generator/compound/adjustment clips are not supported")
     props = mpi.GetClipProperty() or {}
     path = props.get("File Path", "")
-    if not path or not os.path.isfile(path):
+    if not path:
+        raise ValueError("compound or nested timeline clips have no source file; keying them is not supported")
+    if not os.path.isfile(path):
         raise ValueError("source is not a single video file (image sequences aren't supported yet): %r" % path)
     src_fps = float(props.get("FPS", 0) or 0)
     tl_fps = float(timeline.GetSetting("timelineFrameRate") or 0)
@@ -351,7 +377,10 @@ def key_one(resolve, cfg, job, timeline, ref, gpu):
     cur = project.GetCurrentTimeline()
     if not cfg["place_on_timeline"] or cur is None or cur.GetUniqueId() != job["timeline_id"]:
         return "imported to the %s bin (timeline changed or placement off): %s" % (BIN_NAME, info["name"])
-    info2 = describe_item(cur, ref)  # re-resolve: the user may have moved things during the run
+    try:
+        info2 = describe_item(cur, ref)  # re-resolve: the user may have moved things during the run
+    except ValueError as ex:
+        return "imported to the %s bin, not placed (%s): %s" % (BIN_NAME, ex, info["name"])
     if (info2["rec_start"], info2["frames"]) != (info["rec_start"], info["frames"]):
         return "imported to the %s bin; clip was edited while keying, not placed: %s" % (BIN_NAME, info["name"])
     t = free_track_above(cur, info2["track"], info2["rec_start"], info2["rec_start"] + info2["frames"])
@@ -372,6 +401,25 @@ def key_one(resolve, cfg, job, timeline, ref, gpu):
             cur.DeleteClips([p for p in placed if p])
         return "imported to the %s bin but placement failed: %s" % (BIN_NAME, info["name"])
     return "keyed %s -> V%d" % (info["name"], t)
+
+
+def supervise(job_path, worker_cmd):
+    """Run the worker; if it dies without writing result.json (crash, kill, import error), say so."""
+    job_dir = os.path.dirname(job_path)
+    result = os.path.join(job_dir, "result.json")
+    try:
+        rc = subprocess.call(worker_cmd, stdin=subprocess.DEVNULL, stdout=sys.stdout, stderr=sys.stderr)
+    except Exception as ex:
+        rc = "could not start worker: %s" % ex
+    if not os.path.exists(result):
+        msg = "worker exited unexpectedly (%s); see %s" % (rc, os.path.join(job_dir, "worker.log"))
+        with open(result, "w") as f:
+            json.dump(["FAILED: " + msg], f, indent=2)
+        notify("CorridorKey finished with errors", msg, True)
+        try:  # don't leave an orphaned infer.py (same process group) running on the GPU
+            os.killpg(os.getpgrp(), 9)
+        except Exception:
+            pass
 
 
 def worker_main(job_path):
