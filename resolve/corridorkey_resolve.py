@@ -196,6 +196,10 @@ def pick_gpu(setting):
     if setting not in ("auto", "", None):
         for g in gpus:
             if setting in (g["uuid"], g["index"]):
+                if g["cc"] < 8.0:
+                    raise RuntimeError("GPU %s (%s) has compute capability %.1f; CorridorKey needs 8.0 or newer "
+                                       "(RTX 30-series+). Set \"gpu\" to \"auto\" or another card." %
+                                       (g["index"], g["name"], g["cc"]))
                 return g
         raise RuntimeError("configured gpu %r not found among %s" % (setting, [g["name"] for g in gpus]))
     ok = [g for g in gpus if g["cc"] >= 8.0]   # upstream: RTX 30-series or newer
@@ -433,12 +437,19 @@ def key_one(resolve, cfg, job, timeline, ref, gpu, detail=None):
 
     # endFrame is exclusive in Resolve 21.2 (inclusive per older docs): try the inclusive form, check the length
     # that actually landed on the timeline, and redo it with the other convention if it is one frame short.
+    def length(placed):
+        # AppendToTimeline can hand back a truthy list holding an invalid item when nothing was placed
+        try:
+            return int(placed[0].GetDuration())
+        except Exception:
+            return -1
+
     placed = append(n - 1)
-    if placed and placed[0] and int(placed[0].GetDuration()) == n - 1:
+    if placed and length(placed) == n - 1:
         cur.DeleteClips(list(placed))
         placed = append(n)
-    if not placed or not placed[0] or int(placed[0].GetDuration()) != n:
-        if placed:
+    if not placed or length(placed) != n:
+        if placed and length(placed) >= 0:
             cur.DeleteClips([p for p in placed if p])
         return "imported to the %s bin but placement failed: %s" % (BIN_NAME, info["name"])
     detail.update(track=t, placed_item_id=placed[0].GetUniqueId())
