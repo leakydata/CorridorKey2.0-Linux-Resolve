@@ -140,7 +140,7 @@ def log_tail(job_dir, n=6):
     return [l[:200] for l in lines[-n:]]
 
 
-def api_status(job_id=None, wait=False, timeout=3600):
+def api_status(job_id=None, wait=False, timeout=3600, on_tick=None):
     jobs_dir = os.path.join(cr.STATE_DIR, "jobs")
     if job_id is None:
         ids = sorted(os.listdir(jobs_dir)) if os.path.isdir(jobs_dir) else []
@@ -152,7 +152,13 @@ def api_status(job_id=None, wait=False, timeout=3600):
         raise CKError("Unknown job", job_id)
     t0 = time.time()
     state, results, details = job_state(job_dir)
+    last_tick = 0.0
     while wait and state == "running" and time.time() - t0 < timeout:
+        if on_tick and time.time() - last_tick >= 10:
+            last_tick = time.time()
+            pr = cr.read_progress(job_dir)
+            if pr:
+                on_tick(pr["text"])
         time.sleep(2)
         state, results, details = job_state(job_dir)
     with open(os.path.join(job_dir, "job.json")) as f:
@@ -161,13 +167,14 @@ def api_status(job_id=None, wait=False, timeout=3600):
            "hint": job.get("hint", "none"), "project": job["project"], "timeline": job["timeline_name"], "clips": [i["name"] for i in job["items"]],
            "dir": job_dir, "log": os.path.join(job_dir, "worker.log")}
     if state == "running":
+        out["progress"] = cr.read_progress(job_dir)
         out["log_tail"] = log_tail(job_dir)
     else:
         out["results"] = details if details is not None else results
     return out
 
 
-def api_key(resolve, mode="video", ids=(), names=(), tracks=(), wait=False, timeout=3600, hint=None):
+def api_key(resolve, mode="video", ids=(), names=(), tracks=(), wait=False, timeout=3600, hint=None, on_tick=None):
     if mode not in ("video", "exr"):
         raise CKError("Bad mode", "mode must be 'video' or 'exr'")
     if hint not in (None,) + cr.HINTS:
@@ -180,7 +187,7 @@ def api_key(resolve, mode="video", ids=(), names=(), tracks=(), wait=False, time
     out = {"ok": True, "job_id": job["id"], "dir": job["dir"], "mode": mode, "hint": job["hint"],
            "clips": [i["name"] for i in job["items"]]}
     if wait:
-        out = api_status(job["id"], wait=True, timeout=timeout)
+        out = api_status(job["id"], wait=True, timeout=timeout, on_tick=on_tick)
         if out["state"] == "running":
             out["timed_out"] = True
     return out
@@ -281,8 +288,12 @@ def human(cmd, out):
                                           ", ".join(out["clips"])))
         for r in out.get("results") or []:
             print("  " + (r["message"] if isinstance(r, dict) else str(r)))
-        if out.get("state") == "running" and out.get("log_tail"):
-            print("  ... " + out["log_tail"][-1])
+        if out.get("state") == "running":
+            pr = out.get("progress")
+            if pr:
+                print("  " + pr["text"])
+            elif out.get("log_tail"):
+                print("  ... " + out["log_tail"][-1])
         print("  log: " + out.get("log", os.path.join(out.get("dir", ""), "worker.log")))
 
 
@@ -315,15 +326,19 @@ def main(argv=None):
     p.add_argument("-n", type=int, default=10)
     a = ap.parse_args(argv)
 
+    def tick(text):  # progress line every ~10 s while waiting (stderr: stdout stays clean for --json)
+        if not getattr(a, "json", False):
+            print("  " + text, file=sys.stderr, flush=True)
+
     try:
         if a.cmd == "doctor":
             out = api_doctor()
         elif a.cmd == "list":
             out = api_list(connect())
         elif a.cmd == "key":
-            out = api_key(connect(), a.mode, a.id, a.clip, a.track, a.wait, a.timeout, a.hint)
+            out = api_key(connect(), a.mode, a.id, a.clip, a.track, a.wait, a.timeout, a.hint, tick)
         elif a.cmd == "status":
-            out = api_status(a.job_id, a.wait, a.timeout)
+            out = api_status(a.job_id, a.wait, a.timeout, tick)
         else:
             out = api_jobs(a.n)
     except CKError as ex:

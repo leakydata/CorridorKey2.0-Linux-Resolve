@@ -71,8 +71,11 @@ Restart Resolve. This also links a `corridorkey-resolve` command into `~/.local/
 2. `Workspace > Scripts > Utility > CorridorKey - Key selected clip` (ProRes 4444) or `... (HDR EXR)`.
    No green screen? See [Footage without a green screen](#footage-without-a-green-screen).
 3. Keep working, but leave the same project and timeline open until the job finishes. A desktop notification
-   appears when it starts and finishes. Jobs are queued per machine so two
-   runs never fight for the GPU.
+   appears when it starts (with a rough time estimate), then updates in place with a progress bar, the current
+   step (trimming, loading the model, keying window 3/8, saving, placing) and an estimated time left, and
+   again when it finishes. Jobs are queued per machine so two runs never fight for the GPU; a queued job says
+   it is waiting. The same progress is available from `corridorkey-resolve status` (below). The percentage is an
+   estimate: it moves in steps with the real stages and is most accurate on clips longer than a few seconds.
 4. The result is imported into a **CorridorKey** media-pool bin (cutout + alpha matte) and the cutout is placed on
    the first free video track above the clip, aligned to it. Put your background below.
 
@@ -110,7 +113,8 @@ corridorkey-resolve key --clip "shot1.mov" --wait          # key a clip by name 
 corridorkey-resolve key --track 1 --mode exr               # key every clip on V1 as EXR, return immediately
 corridorkey-resolve key --clip "talk.mov" --hint person    # no green screen: guide the key with a person matte
 corridorkey-resolve key --id <timeline-item-id> --wait --json
-corridorkey-resolve status [JOB_ID] [--wait]; corridorkey-resolve jobs
+corridorkey-resolve status [JOB_ID] [--wait]     # progress, e.g. "44%  talk.mov: keying (window 3/8), ~2 min left"
+corridorkey-resolve jobs
 ```
 
 Add `--json` to any command for a single machine-readable JSON object (errors included). With no filter, `key`

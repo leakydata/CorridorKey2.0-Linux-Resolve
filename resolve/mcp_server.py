@@ -61,7 +61,8 @@ TOOLS = [
          "tracks": {"type": "array", "items": {"type": "integer"}, "description": "video track numbers"}}},
      "annotations": {"readOnlyHint": False, "destructiveHint": False}},
     {"name": "corridorkey_job_status",
-     "description": "State of a keying job: running, done or failed, with per-clip results (placed track, output "
+     "description": "State of a keying job: running (with a progress dict: pct, stage, eta_seconds), done or failed, "
+                    "with per-clip results (placed track, output "
                     "files, message). Omit job_id for the newest job. wait_seconds (max %d) blocks until the job "
                     "finishes or the time is up." % MAX_WAIT,
      "inputSchema": {"type": "object", "properties": {

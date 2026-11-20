@@ -230,7 +230,7 @@ def pick_gpu(setting):
     return max(ok, key=lambda g: g["mem"])
 
 
-def run_logged(cmd, env=None, cwd=None, label=""):
+def run_logged(cmd, env=None, cwd=None, label="", on_line=None):
     print("$ " + " ".join(cmd), flush=True)
     p = subprocess.Popen(cmd, env=env, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                          text=True, bufsize=1)
@@ -238,6 +238,11 @@ def run_logged(cmd, env=None, cwd=None, label=""):
     for line in p.stdout:
         line = line.rstrip("\n")
         print(line, flush=True)
+        if on_line:
+            try:
+                on_line(line)
+            except Exception:
+                pass
         tail.append(line)
         del tail[:-15]
     rc = p.wait()
@@ -314,18 +319,160 @@ def describe_item(timeline, ref):
             "fusion_comps": item.GetFusionCompCount()}
 
 
-def estimate(info):
+def estimate_seconds(info):
     """Rough run time: about 0.7 s per megapixel-frame on an RTX 4090 (measured 1080x1920 and 3840x2160)."""
     try:
         w, h = [int(x) for x in str(info["mpi"].GetClipProperty("Resolution")).split("x")[:2]]
     except Exception:
         w, h = 1920, 1080
-    sec = 20 + info["frames"] * w * h / 1e6 * 0.7
+    return 20 + info["frames"] * w * h / 1e6 * 0.7
+
+
+def fmt_duration(sec):
     if sec < 90:
-        return "about a minute"
+        return "about a minute" if sec > 45 else "under a minute"
     if sec < 5400:
         return "about %d min" % round(sec / 60)
     return "about %.1f hours" % (sec / 3600)
+
+
+def fmt_left(sec):
+    """'~2 min left' style, '' when there is little left to say."""
+    if sec <= 20:
+        return ""
+    if sec < 90:
+        return ", ~1 min left"
+    if sec < 5400:
+        return ", ~%d min left" % round(sec / 60)
+    return ", ~%.1f h left" % (sec / 3600)
+
+
+def estimate(info):
+    return fmt_duration(estimate_seconds(info))
+
+
+# --------------------------------------------------------------------------- progress
+
+class Progress:
+    """Worker-side progress. Writes progress.json in the job dir (read by `corridorkey-resolve status`, the MCP
+    server and read_progress()) and keeps a desktop notification with a progress bar up to date. The file holds the
+    state at the last event plus how long the current segment is expected to take, so a reader can interpolate."""
+
+    def __init__(self, job_dir, job_id, clips):
+        self.path = os.path.join(job_dir, "progress.json")
+        self.job_id = job_id
+        self.clips = clips                       # [{"name", "weight", "est"}] in job order
+        self.total = sum(c["weight"] for c in clips) or 1
+        self.i = 0
+        self.last_note = (0.0, -10.0, "")        # time, pct, label of the last notification
+
+    def clip_start(self, i):
+        self.i = i
+
+    def update(self, label, frac, span, expected, clip_eta):
+        """frac = share of the current clip done now; span = share it may still advance during this segment
+        (taking `expected` seconds); clip_eta = seconds left for this clip."""
+        done = sum(c["weight"] for c in self.clips[:self.i])
+        w = self.clips[self.i]["weight"] if self.i < len(self.clips) else 0
+        pct = 100.0 * (done + w * frac) / self.total
+        later = sum(c["est"] for c in self.clips[self.i + 1:])
+        d = {"pct": round(pct, 1), "span_pct": round(100.0 * w * span / self.total, 2),
+             "segment_seconds": max(1.0, float(expected)), "stage": label,
+             "clip": self.clips[self.i]["name"] if self.i < len(self.clips) else "",
+             "clip_index": self.i + 1, "clip_count": len(self.clips),
+             "eta_seconds": round(clip_eta + later), "updated": time.time()}
+        try:
+            tmp = self.path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(d, f)
+            os.replace(tmp, self.path)
+        except OSError:
+            pass
+        self._notify(d)
+
+    def _notify(self, d):
+        t, last_pct, last_label = self.last_note
+        now = time.time()
+        if d["stage"] == last_label and (now - t < 15 or d["pct"] - last_pct < 3):
+            return
+        if now - t < 4:
+            return
+        self.last_note = (now, d["pct"], d["stage"])
+        exe = shutil.which("notify-send")
+        if not exe:
+            return
+        body = "%s%s" % (d["stage"], fmt_left(d["eta_seconds"]))
+        if d["clip_count"] > 1:
+            body = "clip %d/%d: %s" % (d["clip_index"], d["clip_count"], body)
+        try:
+            subprocess.run([exe, "-a", "CorridorKey", "-t", "6000", "-h", "int:value:%d" % int(d["pct"]),
+                            "-h", "string:x-canonical-private-synchronous:corridorkey-" + self.job_id,
+                            "CorridorKey %d%%" % int(d["pct"]), body], timeout=5, check=False)
+        except Exception:
+            pass
+
+
+_PROG = None
+
+
+def prog(label, frac, span=0.0, expected=1.0, eta=0.0):
+    if _PROG is not None:
+        _PROG.update(label, frac, span, expected, eta)
+
+
+def read_progress(job_dir):
+    """Live progress of a running job as a dict (pct, stage, clip, eta_seconds, text), or None."""
+    try:
+        with open(os.path.join(job_dir, "progress.json")) as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return None
+    el = max(0.0, time.time() - d["updated"])
+    pct = d["pct"] + d["span_pct"] * min(0.95, el / d["segment_seconds"])
+    eta = max(0, int(d["eta_seconds"] - el))
+    clip = d["clip"] + (" (%d/%d)" % (d["clip_index"], d["clip_count"]) if d["clip_count"] > 1 else "")
+    text = "%d%%  %s: %s" % (int(min(pct, 99)), clip, d["stage"])
+    text += fmt_left(eta)
+    return {"pct": round(min(pct, 99.0), 1), "stage": d["stage"], "clip": d["clip"], "clip_index": d["clip_index"],
+            "clip_count": d["clip_count"], "eta_seconds": eta, "text": text}
+
+
+class _InferProgress:
+    """Turns infer.py's stage lines into progress (see the stage timings: load ~30 s, windows ~equal, write)."""
+
+    def __init__(self, base, span, est):
+        self.base, self.span, self.est = base, span, est   # this stage's range within the clip, estimated seconds
+        self.n = self.k = 0
+        self.t_marker = time.time()
+        self.per_window = None
+
+    def _set(self, label, f, nxt, expected, eta):
+        prog(label, self.base + self.span * f, self.span * (nxt - f), expected, eta)
+
+    def line(self, line):
+        now = time.time()
+        if line.startswith("Loading CorridorKey"):
+            self._set("loading the model", 0.0, 0.10, 30, self.est)
+        elif "probed" in line and "frames" in line:
+            self._set("analysing the clip", 0.10, 0.17, max(5, self.est * 0.1), self.est * 0.9)
+        elif "Hann stage1" in line:
+            m = re.search(r"windows=(\d+)", line)
+            self.n, self.k, self.t_marker = int(m.group(1)) if m else 1, 0, now
+            self._window()
+        elif re.match(r"\s*window (\d+)/(\d+)", line):
+            m = re.match(r"\s*window (\d+)/(\d+)", line)
+            self.k, self.n = int(m.group(1)), int(m.group(2))
+            self.per_window, self.t_marker = now - self.t_marker, now
+            self._window()
+        elif line.strip().startswith("wrote"):
+            self._set("saving", 0.97, 1.0, 5, 5)
+
+    def _window(self):
+        k, n = self.k, max(self.n, 1)
+        f = 0.17 + 0.78 * k / n
+        pw = self.per_window or max(5.0, (self.est - 30) / n)
+        label = "keying" if n == 1 else "keying (window %d/%d)" % (min(k + 1, n), n)
+        self._set(label, f, 0.17 + 0.78 * min(k + 1, n) / n, pw, pw * (n - k) + 10)
 
 
 def make_intermediate(info, out_path):
@@ -341,7 +488,7 @@ def make_intermediate(info, out_path):
     return rate
 
 
-def run_inference(cfg, job, in_path, out_dir, gpu):
+def run_inference(cfg, job, in_path, out_dir, gpu, stage=(0.0, 1.0, 60.0)):
     ck_dir = cfg["ck_dir"]
     py = cfg["python"] or os.path.join(ck_dir, "venv", "bin", "python")
     tmp = os.path.join(out_dir, "tmp")
@@ -361,10 +508,17 @@ def run_inference(cfg, job, in_path, out_dir, gpu):
     env["PYTHONUNBUFFERED"] = "1"
     os.makedirs(STATE_DIR, exist_ok=True)
     with open(os.path.join(STATE_DIR, "gpu.lock"), "w") as lock:   # queue jobs; Resolve shares this GPU too
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            prog("waiting for another CorridorKey job to finish", stage[0], 0.0, 1, stage[2])
+            fcntl.flock(lock, fcntl.LOCK_EX)
         if hint_dir:
+            prog("finding the person in every frame", stage[0] - 0.04, 0.04, max(8.0, stage[2] * 0.1), stage[2])
             make_person_hint(py, in_path, hint_dir, env)
-        run_logged(cmd, env=env, cwd=ck_dir, label="infer.py")
+        ip = _InferProgress(*stage)
+        prog("loading the model", stage[0], stage[1] * 0.1, 30, stage[2])
+        run_logged(cmd, env=env, cwd=ck_dir, label="infer.py", on_line=ip.line)
     shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -460,8 +614,12 @@ def key_one(resolve, cfg, job, timeline, ref, gpu, detail=None):
         print("WARNING: %s has Fusion comps; the key is made from the untouched source file." % info["name"])
 
     in_path = os.path.join(out_dir, stem + ".mov")
+    est = estimate_seconds(info)
+    prog("trimming the source", 0.0, 0.05, 2 + info["frames"] * 0.02, est)
     rate = make_intermediate(info, in_path)
-    run_inference(cfg, job, in_path, out_dir, gpu)
+    base = 0.09 if hint == "person" else 0.05
+    run_inference(cfg, job, in_path, out_dir, gpu, stage=(base, 0.93 - base, est))
+    prog("importing into Resolve", 0.93, 0.04, 5, 6)
     cutout_ref, alpha_ref = collect_outputs(out_dir, stem, exr)
     detail.update(output_dir=out_dir, cutout=_ref_path(cutout_ref),
                   alpha=_ref_path(alpha_ref) if alpha_ref is not None else os.path.join(out_dir, stem + "_alpha.mp4"))
@@ -495,6 +653,7 @@ def key_one(resolve, cfg, job, timeline, ref, gpu, detail=None):
         return "imported to the %s bin, not placed (%s): %s" % (BIN_NAME, ex, info["name"])
     if (info2["rec_start"], info2["frames"]) != (info["rec_start"], info["frames"]):
         return "imported to the %s bin; clip was edited while keying, not placed: %s" % (BIN_NAME, info["name"])
+    prog("placing on the timeline", 0.97, 0.02, 3, 3)
     t = free_track_above(cur, info2["track"], info2["rec_start"], info2["rec_start"] + info2["frames"])
     n = info["frames"]
 
@@ -559,7 +718,17 @@ def worker_main(job_path):
         if not timeline or project.GetName() != job["project"] or timeline.GetUniqueId() != job["timeline_id"]:
             raise RuntimeError("project/timeline changed before the worker started")
         gpu = pick_gpu(cfg["gpu"])
+        global _PROG
+        clips = []
         for ref in job["items"]:
+            try:
+                inf = describe_item(timeline, ref)
+                clips.append({"name": ref["name"], "weight": inf["frames"], "est": estimate_seconds(inf)})
+            except Exception:
+                clips.append({"name": ref["name"], "weight": 1, "est": 0})
+        _PROG = Progress(os.path.dirname(job_path), job["id"], clips)
+        for idx, ref in enumerate(job["items"]):
+            _PROG.clip_start(idx)
             d = {"clip": ref["name"], "item_id": ref["id"]}
             try:
                 msg = key_one(resolve, cfg, job, timeline, ref, gpu, d)
