@@ -48,10 +48,13 @@ TOOLS = [
                     "GPU). The keyed result is placed on the first free video track above each clip, aligned to it, "
                     "and also imported into a 'CorridorKey' bin. Poll with corridorkey_job_status. With no "
                     "filter it keys the selection, else the clip under the playhead. Source clips must be plain video "
-                    "files at the timeline frame rate, not retimed.",
+                    "files at the timeline frame rate, not retimed. For footage of a person WITHOUT a green or "
+                    "blue screen, set hint='person' (an automatic person matte guides the keyer).",
      "inputSchema": {"type": "object", "properties": {
          "mode": {"type": "string", "enum": ["video", "exr"], "default": "video",
                   "description": "video = ProRes 4444 straight-alpha cutout; exr = linear half-float EXR sequence"},
+         "hint": {"type": "string", "enum": ["none", "person"],
+                  "description": "person = automatic person matte as a hint (no green screen); default none"},
          "item_ids": {"type": "array", "items": {"type": "string"},
                       "description": "timeline item ids from corridorkey_list_clips (most precise)"},
          "clip_names": {"type": "array", "items": {"type": "string"}, "description": "exact clip names"},
@@ -78,7 +81,7 @@ def call_tool(name, a):
         return ck.api_list(ck.connect())
     if name == "corridorkey_key_clips":
         return ck.api_key(ck.connect(), a.get("mode", "video"), a.get("item_ids") or (),
-                          a.get("clip_names") or (), a.get("tracks") or (), wait=False)
+                          a.get("clip_names") or (), a.get("tracks") or (), wait=False, hint=a.get("hint"))
     if name == "corridorkey_job_status":
         wait = max(0, min(int(a.get("wait_seconds") or 0), MAX_WAIT))
         return ck.api_status(a.get("job_id"), wait=wait > 0, timeout=wait)

@@ -6,8 +6,9 @@ For scripts, AI agents and MCP wrappers; the menu entries do the same thing for 
 
     ck.py doctor                          check the install, the GPU and the connection to Resolve
     ck.py list                            clips on the current timeline: id, track, range, keyable or why not
-    ck.py key [--mode video|exr] [--clip NAME]... [--track N]... [--id UID]... [--wait]
-                                          key clips (no filter = the selection, else the clip under the playhead)
+    ck.py key [--mode video|exr] [--hint none|person] [--clip NAME]... [--track N]... [--id UID]... [--wait]
+                                          key clips (no filter = the selection, else the clip under the playhead);
+                                          --hint person: auto person matte as a hint, for footage with no green screen
     ck.py status [JOB_ID] [--wait]        a job's state/results (default: newest job)
     ck.py jobs [-n 10]                    recent jobs
 
@@ -27,6 +28,7 @@ import corridorkey_resolve as cr  # noqa: E402
 from corridorkey_resolve import CKError  # noqa: E402
 
 RESOLVE_PYTHON = "/opt/resolve/bin/ResolvePython"
+HINT_MODEL = "deeplabv3_resnet101_coco-586e9e4e.pth"  # torchvision's file name for the person-matte model
 
 
 # --------------------------------------------------------------------------- connection
@@ -156,7 +158,7 @@ def api_status(job_id=None, wait=False, timeout=3600):
     with open(os.path.join(job_dir, "job.json")) as f:
         job = json.load(f)
     out = {"ok": state != "failed", "job_id": job_id, "state": state, "mode": job["mode"],
-           "project": job["project"], "timeline": job["timeline_name"], "clips": [i["name"] for i in job["items"]],
+           "hint": job.get("hint", "none"), "project": job["project"], "timeline": job["timeline_name"], "clips": [i["name"] for i in job["items"]],
            "dir": job_dir, "log": os.path.join(job_dir, "worker.log")}
     if state == "running":
         out["log_tail"] = log_tail(job_dir)
@@ -165,15 +167,17 @@ def api_status(job_id=None, wait=False, timeout=3600):
     return out
 
 
-def api_key(resolve, mode="video", ids=(), names=(), tracks=(), wait=False, timeout=3600):
+def api_key(resolve, mode="video", ids=(), names=(), tracks=(), wait=False, timeout=3600, hint=None):
     if mode not in ("video", "exr"):
         raise CKError("Bad mode", "mode must be 'video' or 'exr'")
+    if hint not in (None,) + cr.HINTS:
+        raise CKError("Bad hint", "hint must be one of: %s" % ", ".join(cr.HINTS))
     items = None
     if ids or names or tracks:
         _, timeline = current(resolve)
         items = pick_items(timeline, ids, names, tracks)
-    job = cr.create_job(resolve, mode, items)
-    out = {"ok": True, "job_id": job["id"], "dir": job["dir"], "mode": mode,
+    job = cr.create_job(resolve, mode, items, hint=hint)
+    out = {"ok": True, "job_id": job["id"], "dir": job["dir"], "mode": mode, "hint": job["hint"],
            "clips": [i["name"] for i in job["items"]]}
     if wait:
         out = api_status(job["id"], wait=True, timeout=timeout)
@@ -214,6 +218,10 @@ def api_doctor():
     add("CorridorKey python", py and os.path.isfile(py), py)
     w = os.path.join(ck, "weights", "corridorkey_v2.safetensors") if ck else ""
     add("model weights", w and os.path.isfile(w), w if w and os.path.isfile(w) else "missing: run scripts/download_weights.py")
+    hm = os.path.join(ck, "weights", "torch", "hub", "checkpoints", HINT_MODEL) if ck else ""
+    add("person-hint model", hm and os.path.isfile(hm),
+        hm if hm and os.path.isfile(hm) else "optional: downloaded on first person-hint job (or rerun install.py)",
+        required=False)
     from shutil import which
     for exe in ("ffmpeg", "ffprobe", "nvidia-smi"):
         add(exe, which(exe), which(exe) or "not on PATH")
@@ -232,7 +240,8 @@ def api_doctor():
         out = r.stdout.strip()
         add("torch sees the GPU", r.returncode == 0 and out.startswith("True"), out or r.stderr.strip()[-200:])
     stubs = [os.path.join(os.path.expanduser("~/.local/share/DaVinciResolve/Fusion/Scripts/Utility"), n)
-             for n in ("CorridorKey - Key selected clip.py", "CorridorKey - Key selected clip (HDR EXR).py")]
+             for n in ("CorridorKey - Key selected clip.py", "CorridorKey - Key selected clip (HDR EXR).py",
+                       "CorridorKey - Key person (no green screen).py")]
     add("Resolve menu entries", all(os.path.exists(p) for p in stubs),
         "Workspace > Scripts > Utility" if all(os.path.exists(p) for p in stubs) else "missing (run install.py)",
         required=False)
@@ -267,8 +276,9 @@ def human(cmd, out):
         for j in out["jobs"]:
             print("%-18s %-8s %-5s %s" % (j["job_id"], j["state"], j["mode"], ", ".join(j["clips"])))
     else:  # key / status
-        print("job %s: %s  (%s, %s)" % (out["job_id"], out.get("state", "started"), out["mode"],
-                                        ", ".join(out["clips"])))
+        print("job %s: %s  (%s%s, %s)" % (out["job_id"], out.get("state", "started"), out["mode"],
+                                          ", person hint" if out.get("hint") == "person" else "",
+                                          ", ".join(out["clips"])))
         for r in out.get("results") or []:
             print("  " + (r["message"] if isinstance(r, dict) else str(r)))
         if out.get("state") == "running" and out.get("log_tail"):
@@ -289,6 +299,9 @@ def main(argv=None):
     add("list", "list clips on the current timeline")
     p = add("key", "key clips")
     p.add_argument("--mode", choices=("video", "exr"), default="video", help="ProRes 4444 (default) or linear EXR")
+    p.add_argument("--hint", choices=cr.HINTS, default=None,
+                   help="person = automatic person matte as a hint, for footage without a green screen "
+                        "(default: the config's \"hint\", normally none)")
     p.add_argument("--clip", action="append", default=[], metavar="NAME", help="timeline clip name (repeatable)")
     p.add_argument("--track", action="append", default=[], type=int, metavar="N", help="video track (repeatable)")
     p.add_argument("--id", action="append", default=[], metavar="UID", help="timeline item id from `list`")
@@ -308,7 +321,7 @@ def main(argv=None):
         elif a.cmd == "list":
             out = api_list(connect())
         elif a.cmd == "key":
-            out = api_key(connect(), a.mode, a.id, a.clip, a.track, a.wait, a.timeout)
+            out = api_key(connect(), a.mode, a.id, a.clip, a.track, a.wait, a.timeout, a.hint)
         elif a.cmd == "status":
             out = api_status(a.job_id, a.wait, a.timeout)
         else:

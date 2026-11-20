@@ -10,6 +10,7 @@ Stdlib only. Re-runnable. Never touches the CorridorKey checkout.
 import argparse
 import json
 import os
+import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -26,11 +27,12 @@ try:
 except NameError:
     import DaVinciResolveScript as _d
     _r = _d.scriptapp("Resolve")
-corridorkey_resolve.launch(_r, mode={mode!r})
+corridorkey_resolve.launch(_r, mode={mode!r}, hint={hint!r})
 '''
-ENTRIES = {
-    "CorridorKey - Key selected clip.py": "video",          # ProRes 4444 straight-alpha cutout
-    "CorridorKey - Key selected clip (HDR EXR).py": "exr",  # linear half-float EXR sequence
+ENTRIES = {  # menu file name: (mode, hint)
+    "CorridorKey - Key selected clip.py": ("video", None),                 # ProRes 4444 straight-alpha cutout
+    "CorridorKey - Key selected clip (HDR EXR).py": ("exr", None),         # linear half-float EXR sequence
+    "CorridorKey - Key person (no green screen).py": ("video", "person"),  # automatic person matte as a hint
 }
 
 
@@ -39,6 +41,8 @@ def main():
     ap.add_argument("--ck-dir", default=os.path.dirname(HERE),
                     help="CorridorKey checkout containing infer.py and a working venv (default: this repo)")
     ap.add_argument("--uninstall", action="store_true")
+    ap.add_argument("--no-hint-model", action="store_true",
+                    help="don't pre-download the person-matte model (about 233 MB; else fetched on first use)")
     a = ap.parse_args()
 
     if a.uninstall:
@@ -72,10 +76,10 @@ def main():
     print("config:", CONFIG)
 
     os.makedirs(SCRIPT_DIR, exist_ok=True)
-    for name, mode in ENTRIES.items():
+    for name, (mode, hint) in ENTRIES.items():
         p = os.path.join(SCRIPT_DIR, name)
         with open(p, "w") as f:
-            f.write(STUB.format(here=HERE, mode=mode))
+            f.write(STUB.format(here=HERE, mode=mode, hint=hint))
         print("installed", p)
     cli = os.path.join(HERE, "ck.py")
     try:  # command-line / AI-agent interface: `corridorkey-resolve doctor|list|key|status|jobs`
@@ -86,6 +90,11 @@ def main():
         print("installed", CLI_LINK, "->", cli)
     except OSError as ex:
         print("could not link the CLI (%s); run it as: python3 %s" % (ex, cli))
+    if not a.no_hint_model:  # torchvision DeepLabV3 for "Key person (no green screen)"; never bundled
+        print("fetching the person-matte model (about 233 MB, once) ...")
+        r = subprocess.run([py, os.path.join(HERE, "hint_matte.py"), "--download"])
+        if r.returncode:
+            print("could not fetch it now; it will be downloaded the first time the person hint is used")
     print("Restart Resolve if it is open, then: Workspace > Scripts > Utility > CorridorKey ...")
 
 

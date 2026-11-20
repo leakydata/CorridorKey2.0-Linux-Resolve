@@ -5,12 +5,11 @@ A free, community fork of [CorridorKey 2.0](https://github.com/nikopueringer/Cor
 `Workspace > Scripts > Utility > CorridorKey - Key selected clip`, and the keyed cutout (straight-alpha ProRes
 4444, or linear HDR EXR) lands on a video track above it when the job finishes.
 
-> **Status: early / experimental.** Verified end to end on Resolve Studio 21.2 for both ProRes 4444 and EXR
-> output: frame-exact trim, inference, import, straight alpha, and placement on the track above the source clip
-> (same length, same record position). The jobs were started through the same `launch()` entry point the menu
-> entries call; clicking the entries from Resolve's Workspace > Scripts menu is still being verified. Only
-> low-resolution, non-green-screen footage has been used so far, so keying quality is untested. See
-> [Known limitations](#known-limitations).
+> **Status: early / experimental.** Verified end to end on Resolve Studio 21.2 for ProRes 4444 and EXR output:
+> frame-exact trim, inference, import, straight alpha, and placement on the track above the source clip (same
+> length, same record position), from 432x240 up to 4K, at 23.976 and 30 fps, including rotated phone clips and
+> real green-screen footage. The menu scripts were run inside Resolve; a hand click on every menu entry with a
+> GUI selection is still being verified. See [Known limitations](#known-limitations).
 
 ## Acknowledgements
 
@@ -70,6 +69,7 @@ Restart Resolve. This also links a `corridorkey-resolve` command into `~/.local/
 
 1. Put a green/blue-screen clip on the timeline and select it (or park the playhead on it).
 2. `Workspace > Scripts > Utility > CorridorKey - Key selected clip` (ProRes 4444) or `... (HDR EXR)`.
+   No green screen? See [Footage without a green screen](#footage-without-a-green-screen).
 3. Keep working, but leave the same project and timeline open until the job finishes. A desktop notification
    appears when it starts and finishes. Jobs are queued per machine so two
    runs never fight for the GPU.
@@ -78,6 +78,25 @@ Restart Resolve. This also links a `corridorkey-resolve` command into `~/.local/
 
 Files and logs: results in `~/Videos/CorridorKey/<project>/...`, job logs in
 `~/.local/state/corridorkey-resolve/jobs/<id>/worker.log`.
+
+### Footage without a green screen
+
+`Workspace > Scripts > Utility > CorridorKey - Key person (no green screen)` is for a person filmed in front of an
+ordinary background (talking-head, phone or webcam footage). Before keying, it makes a rough matte of the person on
+every frame with torchvision's DeepLabV3 segmentation model and passes it to CorridorKey as a hint video
+(upstream's `--hint_video`, see "Choosing An Inference Mode" in the upstream [README.md](../README.md)). The hint tells
+the keyer *which* subject to keep; CorridorKey still makes the edges. Without it, the model has to guess what the
+subject is, and on a normal room it tends to keep nearby objects (a mic arm, a chair) and leave a haze around the
+person.
+
+- People only: on a clip with no person the job stops with "no person found" instead of guessing.
+- The matte model (about 233 MB, BSD-3-Clause, from torchvision) is downloaded once by `install.py` into
+  `weights/torch/` (or on first use; `install.py --no-hint-model` skips it). It is never bundled with this repository.
+- It adds a few seconds per clip (about 0.1 s per 1080x1920 frame on an RTX 4090).
+- The result is named `CK_<clip>_..._person`. It is a key of a normal room, not a green-screen key: expect softer
+  hair edges than with a real screen.
+- Command line: `corridorkey-resolve key --hint person`. Set `"hint": "person"` in the config to make it the default
+  for the other menu entries too (for example for EXR output).
 
 ## Command line and AI agents
 
@@ -89,6 +108,7 @@ corridorkey-resolve doctor                       # check install, GPU, Resolve c
 corridorkey-resolve list                         # clips on the current timeline: id, track, keyable or why not
 corridorkey-resolve key --clip "shot1.mov" --wait          # key a clip by name and wait for the result
 corridorkey-resolve key --track 1 --mode exr               # key every clip on V1 as EXR, return immediately
+corridorkey-resolve key --clip "talk.mov" --hint person    # no green screen: guide the key with a person matte
 corridorkey-resolve key --id <timeline-item-id> --wait --json
 corridorkey-resolve status [JOB_ID] [--wait]; corridorkey-resolve jobs
 ```
@@ -121,6 +141,8 @@ minute or more, so `corridorkey_key_clips` returns a job id immediately and `cor
 | `extra_infer_args` | `[]` | passed to `infer.py`, e.g. `["--hann_chunk","24","--hann_stride","12"]` |
 | `keep_intermediate` | `false` | keep the trimmed ProRes source copy |
 | `place_on_timeline` | `true` | `false` = only import to the bin |
+| `hint` | `"none"` | `"person"` = always use the automatic person matte as a hint (the "Key person" entry sets it per job) |
+| `hint_quality` | `0.75` | how much the keyer trusts that matte (upstream `--hint_quality`; 0.95 = artist matte, 0.5 = loose) |
 
 ## How it works
 
@@ -136,7 +158,8 @@ places them on the timeline. All integration code is in [`resolve/`](../resolve/
 - Video files only (no image sequences / compound / generator clips) in this version.
 - Resolve and CorridorKey share the GPU. Scrubbing heavily in Resolve during a job can run either out of VRAM.
 - Resolve on Linux needs a Plasma/X11 session for working mouse input; this is a Resolve issue, not this fork's.
-- No hint-matte workflow yet (upstream supports first-frame and full hint videos).
+- The only hint the integration makes is the automatic person matte; your own roto/hint videos are not wired to
+  the menu yet (upstream `infer.py --hint_video` takes them directly).
 
 ## Roadmap
 

@@ -39,7 +39,11 @@ DEFAULTS = {
     "extra_infer_args": [],             # e.g. ["--hann_chunk", "24", "--hann_stride", "12"]
     "keep_intermediate": False,
     "place_on_timeline": True,
+    "hint": "none",                     # "none" or "person" (auto person matte as a hint, for no-green-screen footage)
+    "hint_quality": 0.75,               # infer.py --hint_quality for the automatic matte (rough but useful)
 }
+HINTS = ("none", "person")
+MIN_PERSON_COVERAGE = 0.005             # median share of the frame the person matte must cover
 
 RESOLVE_API = "/opt/resolve/Developer/Scripting"
 RESOLVE_LIB = "/opt/resolve/libs/Fusion/fusionscript.so"
@@ -108,11 +112,14 @@ def preflight(cfg=None):
     return cfg
 
 
-def create_job(resolve, mode="video", items=None):
+def create_job(resolve, mode="video", items=None, hint=None):
     """Write job.json and start the supervised worker. `items` = timeline items to key; None = the timeline's
-    selection, else the clip under the playhead (what the menu entries do). Returns the job dict (with "dir").
-    Raises CKError for anything the user can fix."""
+    selection, else the clip under the playhead (what the menu entries do). `hint` = "none" or "person"
+    (None: the config's "hint"). Returns the job dict (with "dir"). Raises CKError for anything the user can fix."""
     cfg = preflight()
+    hint = hint or cfg["hint"] or "none"
+    if hint not in HINTS:
+        raise CKError("CorridorKey", "hint must be one of %s, got %r" % (", ".join(HINTS), hint))
     project = resolve.GetProjectManager().GetCurrentProject()
     timeline = project.GetCurrentTimeline() if project else None
     if timeline is None:
@@ -140,6 +147,7 @@ def create_job(resolve, mode="video", items=None):
     job = {
         "id": job_id,
         "mode": mode,
+        "hint": hint,
         "project": project.GetName(),
         "timeline_id": timeline.GetUniqueId(),
         "timeline_name": timeline.GetName(),
@@ -170,11 +178,13 @@ def create_job(resolve, mode="video", items=None):
     return job
 
 
-def launch(resolve, mode="video"):
-    """Entry point for the menu stubs. mode: "video" (ProRes 4444) or "exr" (linear half-float EXR)."""
+def launch(resolve, mode="video", hint=None):
+    """Entry point for the menu stubs. mode: "video" (ProRes 4444) or "exr" (linear half-float EXR);
+    hint: "person" for footage without a green screen (None: config default)."""
     try:
-        job = create_job(resolve, mode)
-        notify("CorridorKey started", "%d clip(s), %s. Log: %s" % (len(job["items"]), mode, job["dir"]))
+        job = create_job(resolve, mode, hint=hint)
+        notify("CorridorKey started", "%d clip(s), %s%s. Log: %s" % (
+            len(job["items"]), mode, ", person hint" if job["hint"] == "person" else "", job["dir"]))
     except CKError as ex:
         notify(ex.title, ex.body, True)
     except Exception:
@@ -221,6 +231,7 @@ def run_logged(cmd, env=None, cwd=None, label=""):
     rc = p.wait()
     if rc != 0:
         raise RuntimeError("%s failed (exit %d): %s" % (label or cmd[0], rc, " | ".join(tail[-4:])))
+    return tail
 
 
 def probe_frames(path):
@@ -275,9 +286,15 @@ def describe_item(timeline, ref):
         raise ValueError("retimed clips (%.1f%%) are not supported" % pct)
     s, e = int(item.GetSourceStartFrame()), int(item.GetSourceEndFrame())
     start, dur = int(item.GetStart()), int(item.GetDuration())
-    # GetSourceEndFrame is exclusive in Resolve 21.2 (inclusive in some older builds, per the scripting docs):
-    # accept either, and treat the timeline duration as the truth for the frame count.
-    if e - s not in (dur, dur - 1):
+    # GetSourceEndFrame is exclusive in Resolve 21.2 (inclusive in some older builds, per the scripting docs), and
+    # for some clips that end on the media's last frame it comes back 2 short while GetSourceEndTime is right.
+    # Accept a match from either the frames or the times; the timeline duration is the truth for the count.
+    spans = [e - s]
+    try:
+        spans.append(int(round((float(item.GetSourceEndTime()) - float(item.GetSourceStartTime())) * src_fps)))
+    except Exception:
+        pass
+    if not any(sp in (dur, dur - 1) for sp in spans):
         raise ValueError("source range (%d..%d) doesn't match timeline duration (%d); retimed or in a transition?" % (s, e, dur))
     e = s + dur - 1
     return {"item": item, "mpi": mpi, "track": track, "path": path, "name": item.GetName(),
@@ -308,6 +325,10 @@ def run_inference(cfg, job, in_path, out_dir, gpu):
            "--outputs", "cutout", "alpha", "--despill_strength", str(cfg["despill_strength"])]
     if exr:
         cmd += ["--output_format", "exr"]
+    hint_dir = None
+    if job.get("hint") == "person":
+        hint_dir = os.path.join(out_dir, "hint") if cfg["keep_intermediate"] else os.path.join(tmp, "hint")
+        cmd += ["--hint_video", hint_dir, "--hint_quality", str(cfg["hint_quality"])]
     cmd += [str(a) for a in cfg["extra_infer_args"]]
     env = dict(os.environ)
     env["CUDA_VISIBLE_DEVICES"] = gpu["uuid"]
@@ -315,8 +336,25 @@ def run_inference(cfg, job, in_path, out_dir, gpu):
     os.makedirs(STATE_DIR, exist_ok=True)
     with open(os.path.join(STATE_DIR, "gpu.lock"), "w") as lock:   # queue jobs; Resolve shares this GPU too
         fcntl.flock(lock, fcntl.LOCK_EX)
+        if hint_dir:
+            make_person_hint(py, in_path, hint_dir, env)
         run_logged(cmd, env=env, cwd=ck_dir, label="infer.py")
     shutil.rmtree(tmp, ignore_errors=True)
+
+
+def make_person_hint(py, in_path, hint_dir, env):
+    """Write a per-frame person matte (hint_matte.py, torchvision DeepLabV3) for infer.py --hint_video."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    tail = run_logged([py, os.path.join(here, "hint_matte.py"), "--input", in_path, "--output_dir", hint_dir],
+                      env=env, label="person matte")
+    summary = {}
+    for line in reversed(tail):
+        if line.startswith("{"):
+            summary = json.loads(line)
+            break
+    if summary.get("median_coverage", 1.0) < MIN_PERSON_COVERAGE:
+        raise RuntimeError("no person found in the clip (the person hint only works on footage with people); "
+                           "use the plain 'Key selected clip' entry")
 
 
 def collect_outputs(out_dir, stem, exr):
@@ -383,9 +421,11 @@ def key_one(resolve, cfg, job, timeline, ref, gpu, detail=None):
     detail = detail if detail is not None else {}
     project = resolve.GetProjectManager().GetCurrentProject()
     info = describe_item(timeline, ref)
-    detail.update(clip=info["name"], frames=info["frames"], rec_start=info["rec_start"], mode=job["mode"])
+    hint = job.get("hint", "none")
+    detail.update(clip=info["name"], frames=info["frames"], rec_start=info["rec_start"], mode=job["mode"], hint=hint)
     exr = job["mode"] == "exr"
-    stem = "%s_f%d-%d" % (safe_name(info["name"]), info["src_start"], info["src_end"])
+    stem = "%s_f%d-%d%s" % (safe_name(info["name"]), info["src_start"], info["src_end"],
+                            "_person" if hint == "person" else "")
     out_dir = os.path.join(cfg["output_root"], safe_name(job["project"]), "%s_%s" % (stem, job["id"]))
     os.makedirs(out_dir, exist_ok=True)
     notify("CorridorKey: keying", "%s (%d frames) on %s" % (info["name"], info["frames"], gpu["name"]))
