@@ -135,6 +135,18 @@ def create_job(resolve, mode="video", items=None, hint=None):
         items = keyable_clips(items)
         if not items:
             raise CKError("CorridorKey", "No keyable clips given.")
+    # A GUI selection also holds the linked audio item (same name); keep each video-track item once.
+    video_ids = {it.GetUniqueId() for t in range(1, timeline.GetTrackCount("video") + 1)
+                 for it in timeline.GetItemListInTrack("video", t) or []}
+    seen, vid = set(), []
+    for i in items:
+        uid = i.GetUniqueId()
+        if uid in video_ids and uid not in seen:
+            seen.add(uid)
+            vid.append(i)
+    if not vid:
+        raise CKError("CorridorKey", "Select a video clip (audio-only selections can't be keyed).")
+    items = vid
 
     job_id = time.strftime("%Y%m%d-%H%M%S")
     job_dir = os.path.join(STATE_DIR, "jobs", job_id)
@@ -302,6 +314,20 @@ def describe_item(timeline, ref):
             "fusion_comps": item.GetFusionCompCount()}
 
 
+def estimate(info):
+    """Rough run time: about 0.7 s per megapixel-frame on an RTX 4090 (measured 1080x1920 and 3840x2160)."""
+    try:
+        w, h = [int(x) for x in str(info["mpi"].GetClipProperty("Resolution")).split("x")[:2]]
+    except Exception:
+        w, h = 1920, 1080
+    sec = 20 + info["frames"] * w * h / 1e6 * 0.7
+    if sec < 90:
+        return "about a minute"
+    if sec < 5400:
+        return "about %d min" % round(sec / 60)
+    return "about %.1f hours" % (sec / 3600)
+
+
 def make_intermediate(info, out_path):
     """Frame-exact trim of the source range to ProRes 422 HQ (no audio). infer.py can't take a start offset."""
     s, e = info["src_start"], info["src_end"]
@@ -428,7 +454,8 @@ def key_one(resolve, cfg, job, timeline, ref, gpu, detail=None):
                             "_person" if hint == "person" else "")
     out_dir = os.path.join(cfg["output_root"], safe_name(job["project"]), "%s_%s" % (stem, job["id"]))
     os.makedirs(out_dir, exist_ok=True)
-    notify("CorridorKey: keying", "%s (%d frames) on %s" % (info["name"], info["frames"], gpu["name"]))
+    notify("CorridorKey: keying", "%s (%d frames, %s) on %s" % (info["name"], info["frames"], estimate(info),
+                                                                   gpu["name"]))
     if info["fusion_comps"]:
         print("WARNING: %s has Fusion comps; the key is made from the untouched source file." % info["name"])
 
