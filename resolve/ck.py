@@ -11,6 +11,7 @@ For scripts, AI agents and MCP wrappers; the menu entries do the same thing for 
                                           --hint person: auto person matte as a hint, for footage with no green screen
     ck.py status [JOB_ID] [--wait]        a job's state/results (default: newest job)
     ck.py jobs [-n 10]                    recent jobs
+    ck.py update                          fetch the latest version (git pull) and refresh the menu entries
 
 Exit codes: 0 ok, 1 finished with failures / doctor found problems, 2 usage or environment error, 3 --wait timed out.
 Needs Resolve running with Preferences > System > General > External scripting using: Local.
@@ -210,6 +211,28 @@ def api_jobs(n=10):
     return {"ok": True, "jobs": rows}
 
 
+def api_update():
+    cfg = cr.load_config()
+    ck = cfg["ck_dir"]
+    if not ck or not os.path.isdir(os.path.join(ck, ".git")):
+        raise CKError("Cannot update", "%s is not a git checkout; reinstall with resolve/install.sh" % (ck or "ck_dir"))
+    def git(*a):
+        return subprocess.run(["git", "-C", ck] + list(a), capture_output=True, text=True)
+    if git("status", "--porcelain", "--untracked-files=no").stdout.strip():
+        raise CKError("Cannot update", "local changes in %s; commit or stash them first" % ck)
+    before = git("rev-parse", "--short", "HEAD").stdout.strip()
+    r = git("pull", "--ff-only")
+    if r.returncode:
+        raise CKError("Update failed", (r.stderr or r.stdout).strip()[-300:])
+    after = git("rev-parse", "--short", "HEAD").stdout.strip()
+    r = subprocess.run([sys.executable, os.path.join(ck, "resolve", "install.py"), "--no-hint-model"],
+                       capture_output=True, text=True)
+    if r.returncode:
+        raise CKError("Update: refreshing menu entries failed", (r.stderr or r.stdout).strip()[-300:])
+    return {"ok": True, "from": before, "to": after, "changed": before != after,
+            "note": "restart Resolve to load changed menu scripts" if before != after else "already up to date"}
+
+
 def api_doctor():
     checks = []
 
@@ -279,6 +302,8 @@ def human(cmd, out):
         for c in out["clips"]:
             tail = "keyable" if c.get("keyable") else "NOT keyable: " + c.get("reason", "")
             print("  V%d  %-36s %7d frames  id=%s  %s" % (c["track"], c["name"][:36], c["frames"], c["id"], tail))
+    elif cmd == "update":
+        print("%s -> %s: %s" % (out["from"], out["to"], out["note"]))
     elif cmd == "jobs":
         for j in out["jobs"]:
             print("%-18s %-8s %-5s %s" % (j["job_id"], j["state"], j["mode"], ", ".join(j["clips"])))
@@ -322,6 +347,7 @@ def main(argv=None):
     p.add_argument("job_id", nargs="?")
     p.add_argument("--wait", action="store_true")
     p.add_argument("--timeout", type=int, default=3600)
+    add("update", "update to the latest version")
     p = add("jobs", "recent jobs")
     p.add_argument("-n", type=int, default=10)
     a = ap.parse_args(argv)
@@ -337,6 +363,8 @@ def main(argv=None):
             out = api_list(connect())
         elif a.cmd == "key":
             out = api_key(connect(), a.mode, a.id, a.clip, a.track, a.wait, a.timeout, a.hint, tick)
+        elif a.cmd == "update":
+            out = api_update()
         elif a.cmd == "status":
             out = api_status(a.job_id, a.wait, a.timeout, tick)
         else:

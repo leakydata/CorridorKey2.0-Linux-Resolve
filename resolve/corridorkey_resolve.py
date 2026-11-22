@@ -23,6 +23,7 @@ import shutil
 import subprocess
 import sys
 import time
+import threading
 import traceback
 
 CONFIG_PATH = os.path.expanduser("~/.config/corridorkey-resolve/config.json")
@@ -65,15 +66,26 @@ def safe_name(s):
     return re.sub(r"[^A-Za-z0-9._-]+", "_", s).strip("_") or "clip"
 
 
-def notify(title, body="", urgent=False):
-    print("[CorridorKey] %s %s" % (title, body), flush=True)
+def notify(title, body="", urgent=False, key=None, pct=None, icon=None, timeout=8000, log=True):
+    """Desktop notification. `key` makes later calls with the same key replace this one in place (one notification
+    per job that turns from progress into the result); `pct` draws a progress bar; urgent = critical (stays until
+    dismissed on Plasma); timeout in ms (0 = until dismissed)."""
+    if log:
+        print("[CorridorKey] %s %s" % (title, body), flush=True)
     exe = shutil.which("notify-send")
-    if exe:
-        try:
-            subprocess.run([exe, "-a", "CorridorKey", "-u", "critical" if urgent else "normal", title, body],
-                           timeout=5, check=False)
-        except Exception:
-            pass
+    if not exe:
+        return
+    cmd = [exe, "-a", "CorridorKey", "-u", "critical" if urgent else "normal", "-t", str(0 if urgent else timeout)]
+    if icon:
+        cmd += ["-i", icon]
+    if key:
+        cmd += ["-h", "string:x-canonical-private-synchronous:corridorkey-" + key]
+    if pct is not None:
+        cmd += ["-h", "int:value:%d" % int(pct)]
+    try:
+        subprocess.run(cmd + [title, body], timeout=5, check=False)
+    except Exception:
+        pass
 
 
 # --------------------------------------------------------------------------- inside Resolve
@@ -195,8 +207,9 @@ def launch(resolve, mode="video", hint=None):
     hint: "person" for footage without a green screen (None: config default)."""
     try:
         job = create_job(resolve, mode, hint=hint)
-        notify("CorridorKey started", "%d clip(s), %s%s. Log: %s" % (
-            len(job["items"]), mode, ", person hint" if job["hint"] == "person" else "", job["dir"]))
+        notify("CorridorKey started", "%d clip(s), %s%s. Starting ..." % (
+            len(job["items"]), mode, ", person hint" if job["hint"] == "person" else ""),
+            key=job["id"], pct=0, icon="applications-multimedia")
     except CKError as ex:
         notify(ex.title, ex.body, True)
     except Exception:
@@ -364,7 +377,37 @@ class Progress:
         self.clips = clips                       # [{"name", "weight", "est"}] in job order
         self.total = sum(c["weight"] for c in clips) or 1
         self.i = 0
-        self.last_note = (0.0, -10.0, "")        # time, pct, label of the last notification
+        self.last_note = 0.0                     # time of the last notification
+        self._stop = threading.Event()
+        threading.Thread(target=self._tick, daemon=True).start()
+
+    def _tick(self):
+        """Refresh the notification every few seconds from the interpolated progress, so it stays on screen and
+        the bar keeps moving between the keyer's coarse stage markers."""
+        while not self._stop.wait(4):
+            pr = read_progress(os.path.dirname(self.path))
+            if pr:
+                self._show(pr["pct"], pr["stage"], pr["eta_seconds"], pr["clip_index"], pr["clip_count"])
+
+    def finish(self, failed, results):
+        self._stop.set()
+        if failed:
+            notify("CorridorKey finished with errors", "\n".join(results), urgent=True, key=self.job_id,
+                   icon="dialog-error")
+        else:
+            notify("CorridorKey done  \u2713", "\n".join(results), key=self.job_id, pct=100,
+                   icon="dialog-ok-apply", timeout=20000)
+
+    def _show(self, pct, stage, eta, idx, count):
+        now = time.time()
+        if now - self.last_note < 2:
+            return
+        self.last_note = now
+        body = "%s%s" % (stage, fmt_left(eta))
+        if count > 1:
+            body = "clip %d/%d: %s" % (idx, count, body)
+        notify("CorridorKey %d%%" % int(pct), body, key=self.job_id, pct=pct, icon="applications-multimedia",
+               timeout=10000, log=False)
 
     def clip_start(self, i):
         self.i = i
@@ -391,25 +434,7 @@ class Progress:
         self._notify(d)
 
     def _notify(self, d):
-        t, last_pct, last_label = self.last_note
-        now = time.time()
-        if d["stage"] == last_label and (now - t < 15 or d["pct"] - last_pct < 3):
-            return
-        if now - t < 4:
-            return
-        self.last_note = (now, d["pct"], d["stage"])
-        exe = shutil.which("notify-send")
-        if not exe:
-            return
-        body = "%s%s" % (d["stage"], fmt_left(d["eta_seconds"]))
-        if d["clip_count"] > 1:
-            body = "clip %d/%d: %s" % (d["clip_index"], d["clip_count"], body)
-        try:
-            subprocess.run([exe, "-a", "CorridorKey", "-t", "6000", "-h", "int:value:%d" % int(d["pct"]),
-                            "-h", "string:x-canonical-private-synchronous:corridorkey-" + self.job_id,
-                            "CorridorKey %d%%" % int(d["pct"]), body], timeout=5, check=False)
-        except Exception:
-            pass
+        self._show(d["pct"], d["stage"], d["eta_seconds"], d["clip_index"], d["clip_count"])
 
 
 _PROG = None
@@ -696,7 +721,7 @@ def supervise(job_path, worker_cmd):
             json.dump([{"status": "failed", "message": msg}], f, indent=2)
         with open(result, "w") as f:
             json.dump(["FAILED: " + msg], f, indent=2)
-        notify("CorridorKey finished with errors", msg, True)
+        notify("CorridorKey finished with errors", msg, True, key=os.path.basename(job_dir), icon="dialog-error")
         try:  # don't leave an orphaned infer.py (same process group) running on the GPU
             os.killpg(os.getpgrp(), 9)
         except Exception:
@@ -750,4 +775,8 @@ def worker_main(job_path):
         json.dump(details, f, indent=2)
     with open(os.path.join(out, "result.json"), "w") as f:
         json.dump(results, f, indent=2)
-    notify("CorridorKey " + ("finished with errors" if failed else "done"), "; ".join(results), failed)
+    if _PROG is not None:
+        _PROG.finish(failed, results)
+    else:
+        notify("CorridorKey " + ("finished with errors" if failed else "done"), "; ".join(results), failed,
+               key=job["id"], icon="dialog-error" if failed else "dialog-ok-apply", timeout=20000)

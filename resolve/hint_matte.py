@@ -9,8 +9,9 @@ subject to key (see "Hint Quality" in the upstream README).
     venv/bin/python resolve/hint_matte.py --input clip.mov --output_dir hint_frames   # prints a JSON summary last
     venv/bin/python resolve/hint_matte.py --download                                  # fetch the model only
 
-The model (about 233 MB, torchvision, BSD-3-Clause; trained on a COCO subset) is downloaded once from
-download.pytorch.org into <checkout>/weights/torch/ and is never redistributed with this repository.
+The model (torchvision's pretrained DeepLabV3-ResNet101, about 233 MB; torchvision's code is BSD-3-Clause, the weights
+were trained on a COCO subset under their own terms) is downloaded once from download.pytorch.org into
+<checkout>/weights/torch/ and is never redistributed with this repository.
 """
 import argparse
 import json

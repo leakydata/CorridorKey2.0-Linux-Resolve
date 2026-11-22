@@ -47,6 +47,26 @@ In short, and without replacing the licence text:
 
 ## Install
 
+One command (no sudo; everything goes in one folder, `~/.local/share/corridorkey-resolve`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/leakydata/CorridorKey2.0-Linux-Resolve/linux-resolve/resolve/install.sh | bash
+```
+
+It checks your machine, shows what it will download and asks before starting, then sets up a private Python
+environment with PyTorch, downloads the model weights (about 5 GB), and adds the Resolve menu entries and the
+`corridorkey-resolve` command. It is safe to run again; it resumes and updates. Prefer to read it first? It is
+[`resolve/install.sh`](../resolve/install.sh): download it, read it, run it (`--yes` skips the question,
+`--dir` picks another folder). You need an NVIDIA RTX 30-series or newer, `git`, `curl`, `ffmpeg`
+(`sudo apt install git curl ffmpeg` on Ubuntu/Kubuntu/Debian) and the NVIDIA driver.
+
+Then, in Resolve: Preferences > System > General > **External scripting using: Local**, and restart Resolve.
+
+**Update:** `corridorkey-resolve update`. **Remove:** `python3 ~/.local/share/corridorkey-resolve/resolve/install.py --uninstall`,
+then delete the folder. Check the setup any time with `corridorkey-resolve doctor`.
+
+<details><summary>Manual install (what the script does)</summary>
+
 ```bash
 git clone https://github.com/leakydata/CorridorKey2.0-Linux-Resolve.git
 cd CorridorKey2.0-Linux-Resolve
@@ -61,9 +81,8 @@ venv/bin/python scripts/download_weights.py
 python3 resolve/install.py
 ```
 
-Restart Resolve. This also links a `corridorkey-resolve` command into `~/.local/bin` (see
-[Command line and AI agents](#command-line-and-ai-agents)); run `corridorkey-resolve doctor` to check the install.
-`python3 resolve/install.py --uninstall` removes the menu entries and the command.
+Restart Resolve. `python3 resolve/install.py --uninstall` removes the menu entries and the command.
+</details>
 
 ## Use
 
@@ -93,8 +112,10 @@ subject is, and on a normal room it tends to keep nearby objects (a mic arm, a c
 person.
 
 - People only: on a clip with no person the job stops with "no person found" instead of guessing.
-- The matte model (about 233 MB, BSD-3-Clause, from torchvision) is downloaded once by `install.py` into
-  `weights/torch/` (or on first use; `install.py --no-hint-model` skips it). It is never bundled with this repository.
+- The matte model is torchvision's pretrained DeepLabV3-ResNet101 (about 233 MB; torchvision's code is BSD-3-Clause,
+  the weights were trained on a COCO subset and are not covered by this fork's licence; check torchvision's terms
+  for your use). `install.py` downloads it once from download.pytorch.org into `weights/torch/` (or on first use;
+  `install.py --no-hint-model` skips it). It is never bundled with this repository.
 - It adds a few seconds per clip (about 0.1 s per 1080x1920 frame on an RTX 4090).
 - The result is named `CK_<clip>_..._person`. It is a key of a normal room, not a green-screen key: expect softer
   hair edges than with a real screen.
@@ -114,7 +135,7 @@ corridorkey-resolve key --track 1 --mode exr               # key every clip on V
 corridorkey-resolve key --clip "talk.mov" --hint person    # no green screen: guide the key with a person matte
 corridorkey-resolve key --id <timeline-item-id> --wait --json
 corridorkey-resolve status [JOB_ID] [--wait]     # progress, e.g. "44%  talk.mov: keying (window 3/8), ~2 min left"
-corridorkey-resolve jobs
+corridorkey-resolve jobs; corridorkey-resolve update
 ```
 
 Add `--json` to any command for a single machine-readable JSON object (errors included). With no filter, `key`
